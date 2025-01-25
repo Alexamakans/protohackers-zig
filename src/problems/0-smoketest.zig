@@ -3,7 +3,7 @@ const net = std.net;
 const posix = std.posix;
 
 pub fn main() !void {
-    const address  =try net.Address.parseIp("0.0.0.0", 7);
+    const address = try net.Address.parseIp("0.0.0.0", 17777);
 
     const tpe: u32 = posix.SOCK.STREAM;
     const protocol = posix.IPPROTO.TCP;
@@ -14,6 +14,7 @@ pub fn main() !void {
     try posix.bind(listener, &address.any, address.getOsSockLen());
     try posix.listen(listener, 128);
 
+    var buf: [128]u8 = undefined;
     while (true) {
         var client_address: net.Address = undefined;
         var client_address_len: posix.socklen_t = @sizeOf(net.Address);
@@ -27,9 +28,19 @@ pub fn main() !void {
 
         std.debug.print("{} connected\n", .{client_address});
 
-        write(socket, "Hello and bye") catch |err| {
-            std.debug.print("error writing: {}\n", .{err});
-        };
+        const timeout = posix.timeval{ .tv_sec = 2, .tv_usec = 500_000 };
+        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
+        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
+
+        const stream = net.Stream{ .handle = socket };
+        while (true) {
+            const read = try stream.read(&buf);
+            if (read == 0) {
+                break;
+            }
+            std.debug.print("received: {s}\n", .{buf[0..read]});
+            try stream.writeAll(buf[0..read]);
+        }
     }
 }
 
