@@ -1,7 +1,9 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const log = std.log;
 const net = std.net;
 const process = std.process;
+const posix = std.posix;
 
 const arg_error_msg = "missing argument. specify test to run. i.e. 00, 01, ...";
 
@@ -26,21 +28,47 @@ pub fn main() !void {
         process.exit(1);
     };
 
-    switch (option) {
-        0 => {
-            log.info("Running 00 - Smoke Test", .{});
-            try smoketest.main();
-        },
-        1 => {
-            log.info("Running 01 - Prime Time", .{});
-            try primetime.main();
-        },
-        2 => {
-            log.info("Running 02 - Means to an End", .{});
-            try meanstoanend.main();
-        },
-        else => {
-            log.err("test not found, try: 00, 01, ...", .{});
-        },
+    try run(option);
+}
+
+fn run(problem: u8) !void {
+    const address = try net.Address.parseIp("0.0.0.0", 17777);
+
+    const socket_type: u32 = posix.SOCK.STREAM;
+    const protocol = posix.IPPROTO.TCP;
+    const listener = try posix.socket(address.any.family, socket_type, protocol);
+    defer posix.close(listener);
+
+    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(i512, 1)));
+    try posix.bind(listener, &address.any, address.getOsSockLen());
+    try posix.listen(listener, 128);
+
+    while (true) {
+        var client_address: net.Address = undefined;
+        var client_address_len: posix.socklen_t = @sizeOf(net.Address);
+
+        const socket = posix.accept(listener, &client_address.any, &client_address_len, 0) catch |err| {
+            std.debug.print("error accept: {}\n", .{err});
+            continue;
+        };
+
+        switch (problem) {
+            0 => {
+                const thread = try std.Thread.spawn(.{}, smoketest.handle, .{ socket, client_address });
+                thread.detach();
+            },
+            1 => {
+                const thread = try std.Thread.spawn(.{}, primetime.handle, .{ socket, client_address });
+                thread.detach();
+            },
+            2 => {
+                const thread = try std.Thread.spawn(.{}, meanstoanend.handle, .{ socket, client_address });
+                thread.detach();
+            },
+            else => {
+                std.debug.print("{} is not implemented in main yet", .{problem});
+                return;
+            },
+        }
     }
 }

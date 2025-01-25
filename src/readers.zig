@@ -4,6 +4,14 @@ const log = std.log.scoped(.reader);
 const net = std.net;
 const posix = std.posix;
 
+pub const Reader = struct {
+    ptr: *anyopaque,
+    readFn: *const fn (ptr: *anyopaque) anyerror![]u8,
+    pub fn read(self: Reader) ![]u8 {
+        return self.readFn(self.ptr);
+    }
+};
+
 pub const SocketReader = struct {
     socket: posix.socket_t,
     const Self = @This();
@@ -13,16 +21,16 @@ pub const SocketReader = struct {
 };
 
 pub const DelimitedReader = struct {
-    reader: SocketReader,
-    delimiter: []const u8,
+    socket: posix.socket_t,
+    delimiter: u8,
     buf: std.ArrayList(u8),
     start: usize,
     pos: usize,
     const Self = @This();
 
-    pub fn create(allocator: Allocator, socket: posix.socket_t, delimiter: []const u8) !Self {
+    pub fn init(allocator: Allocator, socket: posix.socket_t, delimiter: u8) Self {
         return DelimitedReader{
-            .reader = SocketReader{ .socket = socket },
+            .socket = socket,
             .delimiter = delimiter,
             .buf = std.ArrayList(u8).init(allocator),
             .start = 0,
@@ -30,17 +38,18 @@ pub const DelimitedReader = struct {
         };
     }
 
-    pub fn read(self: *Self) !usize {
+    pub fn deinit(self: *Self) void {
+        self.buf.deinit();
+    }
+
+    pub fn read(ptr: *anyopaque) ![]u8 {
+        const self: *DelimitedReader = @ptrCast(@alignCast(ptr));
         while (true) {
-            if (self.get_message()) |message| {
+            if (try self.get_message()) |message| {
                 return message;
             }
 
-            if (self.pos >= self.buf.capacity) {
-                self.optimize_or_grow();
-            }
-
-            const n = try self.reader.read(self.buf.items[self.pos..]);
+            const n = try posix.read(self.socket, self.buf.items[self.pos..]);
             if (n == 0) {
                 if (self.start == self.pos) {
                     return error.Closed;
@@ -55,28 +64,33 @@ pub const DelimitedReader = struct {
         }
     }
 
-    fn get_message(self: *Self) ?[]u8 {
+    fn get_message(self: *Self) !?[]u8 {
+        std.debug.assert(self.pos >= self.start);
         const unprocessed = self.buf.items[self.start..self.pos];
-        if (std.mem.indexOf(u8, self.buf.items, self.delimiter)) |i| {
-            i += 1;
-            self.start += i;
-            return unprocessed[0..i];
+        if (std.mem.indexOfScalar(u8, unprocessed, self.delimiter)) |i| {
+            std.debug.assert(i + 1 <= unprocessed.len);
+            self.start += i + 1;
+            return unprocessed[0 .. i + 1];
         }
         try self.optimize_or_grow();
         return null;
     }
 
-    fn optimize_or_grow(self: *Self) void {
+    fn optimize_or_grow(self: *Self) !void {
         std.debug.assert(self.pos <= self.buf.items.len);
-        if (self.pos == self.buf.capacity) {
+        if (self.pos == self.buf.items.len) {
             self.shift_to_front();
         }
-        if (self.pos == self.buf.capacity) {
-            self.buf.resize(self.buf.capacity * 2);
+        if (self.pos == self.buf.items.len) {
+            if (self.buf.capacity == 0) {
+                try self.buf.resize(128);
+            } else {
+                try self.buf.resize(self.buf.capacity * 2);
+            }
         }
     }
 
-    fn shift_to_front(self: *Self) !void {
+    fn shift_to_front(self: *Self) void {
         if (self.start == 0) {
             return;
         }
@@ -85,24 +99,35 @@ pub const DelimitedReader = struct {
         self.start = 0;
         self.pos = unprocessed.len;
     }
+
+    pub fn reader(self: *Self) Reader {
+        return Reader{ .ptr = self, .readFn = read };
+    }
 };
 
 pub const PacketReader = struct {
-    reader: SocketReader,
+    socket: posix.socket_t,
     packet_length: usize,
     buf: []u8,
     start: usize,
     pos: usize,
     const Self = @This();
-    pub fn create(allocator: Allocator, socket: posix.socket_t, packet_length: usize) !Self {
-        return DelimitedReader{
-            .reader = SocketReader{ .socket = socket },
+    pub fn init(allocator: Allocator, socket: posix.socket_t, packet_length: usize) !Self {
+        return PacketReader{
+            .socket = socket,
             .packet_length = packet_length,
-            .buf = allocator.alloc(u8, packet_length * 64),
+            .buf = try allocator.alloc(u8, packet_length * 64),
+            .start = 0,
+            .pos = 0,
         };
     }
 
-    pub fn read(self: *Self) !void {
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        allocator.free(self.buf);
+    }
+
+    pub fn read(ptr: *anyopaque) ![]u8 {
+        const self: *PacketReader = @ptrCast(@alignCast(ptr));
         while (true) {
             if (self.get_message()) |message| {
                 return message;
@@ -110,7 +135,7 @@ pub const PacketReader = struct {
 
             self.optimize_or_grow();
 
-            const n = try self.reader.read(self.buf[self.pos..]);
+            const n = try posix.read(self.socket, self.buf[self.pos..]);
             if (n == 0) {
                 if (self.start == self.pos) {
                     return error.Closed;
@@ -126,7 +151,7 @@ pub const PacketReader = struct {
 
     fn get_message(self: *Self) ?[]u8 {
         if (self.pos - self.start >= self.packet_length) {
-            const packet = self.buf.items[self.start..self.pos];
+            const packet = self.buf[self.start..self.pos];
             self.start += self.packet_length;
             return packet;
         }
@@ -137,7 +162,7 @@ pub const PacketReader = struct {
         self.shift_to_front();
     }
 
-    fn shift_to_front(self: *Self) !void {
+    fn shift_to_front(self: *Self) void {
         if (self.start == 0) {
             return;
         }
@@ -145,9 +170,13 @@ pub const PacketReader = struct {
         if (remaining >= self.packet_length * 16) {
             return;
         }
-        const unprocessed = self.buf.items[self.start..self.pos];
-        std.mem.copyForwards(u8, self.buf.items[0..unprocessed.len], unprocessed);
+        const unprocessed = self.buf[self.start..self.pos];
+        std.mem.copyForwards(u8, self.buf[0..unprocessed.len], unprocessed);
         self.start = 0;
         self.pos = unprocessed.len;
+    }
+
+    pub fn reader(self: *Self) Reader {
+        return Reader{ .ptr = self, .readFn = read };
     }
 };
