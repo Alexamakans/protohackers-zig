@@ -10,6 +10,7 @@ const arg_error_msg = "missing argument. specify test to run. i.e. 00, 01, ...";
 const smoketest = @import("problems/0-smoketest.zig");
 const primetime = @import("problems/1-primetime.zig");
 const meanstoanend = @import("problems/2-meanstoanend.zig");
+const budgetchat = @import("problems/3-budgetchat.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -29,6 +30,9 @@ pub fn main() !void {
     };
 
     try run(option);
+    if (option == 3) {
+        budgetchat.deinit();
+    }
 }
 
 fn run(problem: u8) !void {
@@ -63,6 +67,10 @@ fn run(problem: u8) !void {
             },
             2 => {
                 const thread = try std.Thread.spawn(.{}, meanstoanend.handle, .{ socket, client_address });
+                thread.detach();
+            },
+            3 => {
+                const thread = try std.Thread.spawn(.{}, budgetchat.handle, .{ socket, client_address });
                 thread.detach();
             },
             else => {

@@ -70,7 +70,9 @@ pub const DelimitedReader = struct {
         if (std.mem.indexOfScalar(u8, unprocessed, self.delimiter)) |i| {
             std.debug.assert(i + 1 <= unprocessed.len);
             self.start += i + 1;
-            return unprocessed[0 .. i + 1];
+
+            // 0..i because we don't want the delimiter included
+            return unprocessed[0 .. i];
         }
         try self.optimize_or_grow();
         return null;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.reader);
 const net = std.net;
 const posix = std.posix;
@@ -7,6 +8,10 @@ pub const Writer = struct {
     ptr: *anyopaque,
     writeFn: *const fn (ptr: *anyopaque, data: []const u8) anyerror!void,
     pub fn write(self: Writer, data: []const u8) !void {
+        return self.writeFn(self.ptr, data);
+    }
+    // allows using std.fmt.format with this as the writer argument.
+    pub fn writeAll(self: Writer, data: []const u8) !void {
         return self.writeFn(self.ptr, data);
     }
 };
@@ -56,6 +61,64 @@ pub const PacketWriter = struct {
         var index = @as(usize, 0);
         while (index < data.len) {
             index += try posix.write(self.socket, data[index..]);
+        }
+    }
+
+    pub fn writer(self: *Self) Writer {
+        return Writer{ .ptr = self, .writeFn = write };
+    }
+};
+
+pub const SyncMultiplexWriter = struct {
+    writers: std.ArrayList(Writer),
+    write_mutex: std.Thread.Mutex,
+    writers_rw_mutex: std.Thread.Mutex,
+    const Self = @This();
+    pub fn init(allocator: Allocator) Self {
+        return SyncMultiplexWriter{
+            .writers = std.ArrayList(Writer).init(allocator),
+            .write_mutex = .{},
+            .writers_rw_mutex = .{},
+        };
+    }
+
+    pub fn deinit(self: Self) void {
+        self.writers.deinit();
+    }
+
+    pub fn add_writer(self: *Self, w: Writer) !void {
+        self.writers_rw_mutex.lock();
+        defer self.writers_rw_mutex.unlock();
+        try self.writers.append(w);
+    }
+
+    pub fn remove_writer(self: *Self, w: Writer) !void {
+        self.writers_rw_mutex.lock();
+        defer self.writers_rw_mutex.unlock();
+        for (self.writers.items, 0..) |item, i| {
+            if (item.ptr == w.ptr) {
+                _ = self.writers.swapRemove(i);
+                break;
+            }
+        }
+    }
+
+    pub fn write(ptr: *anyopaque, data: []const u8) !void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        for (self.writers.items) |item| {
+            try item.write(data);
+        }
+    }
+
+    pub fn write_from(self: *Self, from: *anyopaque, data: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        for (self.writers.items) |item| {
+            if (item.ptr != from) {
+                try item.write(data);
+            }
         }
     }
 
