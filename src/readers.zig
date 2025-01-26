@@ -130,6 +130,10 @@ pub const PacketReader = struct {
         const self: *PacketReader = @ptrCast(@alignCast(ptr));
         while (true) {
             if (self.get_message()) |message| {
+                if (message.len != self.packet_length) {
+                    std.debug.print("expected {} bytes but received {} bytes", .{ self.packet_length, message.len });
+                    return error.ReadError;
+                }
                 return message;
             }
 
@@ -142,6 +146,10 @@ pub const PacketReader = struct {
                 } else {
                     const unprocessed = self.buf[self.start..self.pos];
                     self.pos = self.start;
+                    if (unprocessed.len != self.packet_length) {
+                        std.debug.print("expected {} bytes but received {} bytes", .{ self.packet_length, unprocessed.len });
+                        return error.ReadError;
+                    }
                     return unprocessed;
                 }
             }
@@ -151,7 +159,7 @@ pub const PacketReader = struct {
 
     fn get_message(self: *Self) ?[]u8 {
         if (self.pos - self.start >= self.packet_length) {
-            const packet = self.buf[self.start..self.pos];
+            const packet = self.buf[self.start .. self.start + self.packet_length];
             self.start += self.packet_length;
             return packet;
         }
