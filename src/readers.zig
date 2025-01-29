@@ -7,8 +7,12 @@ const posix = std.posix;
 pub const Reader = struct {
     ptr: *anyopaque,
     readFn: *const fn (ptr: *anyopaque) anyerror![]u8,
+    closeFn: *const fn (ptr: *anyopaque) void,
     pub fn read(self: Reader) ![]u8 {
         return self.readFn(self.ptr);
+    }
+    pub fn close(self: Reader) void {
+        return self.closeFn(self.ptr);
     }
 };
 
@@ -51,13 +55,7 @@ pub const DelimitedReader = struct {
 
             const n = try posix.read(self.socket, self.buf.items[self.pos..]);
             if (n == 0) {
-                if (self.start == self.pos) {
-                    return error.Closed;
-                } else {
-                    const unprocessed = self.buf.items[self.start..self.pos];
-                    self.pos = self.start;
-                    return unprocessed;
-                }
+                return error.Closed;
             }
 
             self.pos += n;
@@ -68,11 +66,9 @@ pub const DelimitedReader = struct {
         std.debug.assert(self.pos >= self.start);
         const unprocessed = self.buf.items[self.start..self.pos];
         if (std.mem.indexOfScalar(u8, unprocessed, self.delimiter)) |i| {
-            std.debug.assert(i + 1 <= unprocessed.len);
             self.start += i + 1;
-
             // 0..i because we don't want the delimiter included
-            return unprocessed[0 .. i];
+            return unprocessed[0..i];
         }
         try self.optimize_or_grow();
         return null;
@@ -102,12 +98,17 @@ pub const DelimitedReader = struct {
         self.pos = unprocessed.len;
     }
 
+    pub fn close(ptr: *anyopaque) void {
+        const self: *DelimitedReader = @ptrCast(@alignCast(ptr));
+        posix.close(self.socket);
+    }
+
     pub fn reader(self: *Self) Reader {
-        return Reader{ .ptr = self, .readFn = read };
+        return Reader{ .ptr = self, .readFn = read, .closeFn = close };
     }
 };
 
-pub const PacketReader = struct {
+pub const FixedSizePacketReader = struct {
     socket: posix.socket_t,
     packet_length: usize,
     buf: []u8,
@@ -115,7 +116,7 @@ pub const PacketReader = struct {
     pos: usize,
     const Self = @This();
     pub fn init(allocator: Allocator, socket: posix.socket_t, packet_length: usize) !Self {
-        return PacketReader{
+        return FixedSizePacketReader{
             .socket = socket,
             .packet_length = packet_length,
             .buf = try allocator.alloc(u8, packet_length * 64),
@@ -129,7 +130,7 @@ pub const PacketReader = struct {
     }
 
     pub fn read(ptr: *anyopaque) ![]u8 {
-        const self: *PacketReader = @ptrCast(@alignCast(ptr));
+        const self: *FixedSizePacketReader = @ptrCast(@alignCast(ptr));
         while (true) {
             if (self.get_message()) |message| {
                 if (message.len != self.packet_length) {
@@ -186,7 +187,12 @@ pub const PacketReader = struct {
         self.pos = unprocessed.len;
     }
 
+    pub fn close(ptr: *anyopaque) void {
+        const self: *FixedSizePacketReader = @ptrCast(@alignCast(ptr));
+        posix.close(self.socket);
+    }
+
     pub fn reader(self: *Self) Reader {
-        return Reader{ .ptr = self, .readFn = read };
+        return Reader{ .ptr = self, .readFn = read, .closeFn = close };
     }
 };

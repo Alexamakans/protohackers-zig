@@ -2,7 +2,7 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const PacketReader = @import("../readers.zig").PacketReader;
+const PacketReader = @import("../readers.zig").FixedSizePacketReader;
 const PacketWriter = @import("../writers.zig").PacketWriter;
 const Stream = @import("../stream.zig").Stream;
 

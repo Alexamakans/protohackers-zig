@@ -7,12 +7,20 @@ const posix = std.posix;
 pub const Writer = struct {
     ptr: *anyopaque,
     writeFn: *const fn (ptr: *anyopaque, data: []const u8) anyerror!void,
+    closeFn: *const fn (ptr: *anyopaque) void,
     pub fn write(self: Writer, data: []const u8) !void {
         return self.writeFn(self.ptr, data);
     }
-    // allows using std.fmt.format with this as the writer argument.
-    pub fn writeAll(self: Writer, data: []const u8) !void {
-        return self.writeFn(self.ptr, data);
+    pub fn close(self: Writer) void {
+        return self.closeFn(self.ptr);
+    }
+};
+
+pub const SocketWriter = struct {
+    socket: posix.socket_t,
+    const Self = @This();
+    pub fn write(self: Self, buf: []const u8) posix.WriteError!usize {
+        return posix.write(self.socket, buf);
     }
 };
 
@@ -39,8 +47,13 @@ pub const DelimitedWriter = struct {
         }
     }
 
+    pub fn close(ptr: *anyopaque) void {
+        const self: *DelimitedWriter = @ptrCast(@alignCast(ptr));
+        posix.close(self.socket);
+    }
+
     pub fn writer(self: *Self) Writer {
-        return Writer{ .ptr = self, .writeFn = write };
+        return Writer{ .ptr = self, .writeFn = write, .closeFn = close };
     }
 };
 
@@ -64,8 +77,13 @@ pub const PacketWriter = struct {
         }
     }
 
+    pub fn close(ptr: *anyopaque) void {
+        const self: *PacketWriter = @ptrCast(@alignCast(ptr));
+        posix.close(self.socket);
+    }
+
     pub fn writer(self: *Self) Writer {
-        return Writer{ .ptr = self, .writeFn = write };
+        return Writer{ .ptr = self, .writeFn = write, .closeFn = close };
     }
 };
 
@@ -122,7 +140,16 @@ pub const SyncMultiplexWriter = struct {
         }
     }
 
+    pub fn close(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.writers_rw_mutex.lock();
+        defer self.writers_rw_mutex.unlock();
+        for (self.writers.items) |item| {
+            item.close();
+        }
+    }
+
     pub fn writer(self: *Self) Writer {
-        return Writer{ .ptr = self, .writeFn = write };
+        return Writer{ .ptr = self, .writeFn = write, .closeFn = close };
     }
 };

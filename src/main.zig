@@ -12,6 +12,8 @@ const primetime = @import("problems/1-primetime.zig");
 const meanstoanend = @import("problems/2-meanstoanend.zig");
 const budgetchat = @import("problems/3-budgetchat.zig");
 const unusualdatabaseprogram = @import("problems/4-unusualdatabaseprogram.zig");
+const mobinthemiddle = @import("problems/5-mobinthemiddle.zig");
+const speeddaemon = @import("problems/6-speeddaemon.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -37,7 +39,7 @@ pub fn main() !void {
 }
 
 fn run(problem: u8) !void {
-    if (problem <= 3) {
+    if (problem <= 3 or problem >= 5) {
         try run_tcp(problem, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     } else {
         try run_udp(problem, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
@@ -50,9 +52,14 @@ fn run_tcp(problem: u8, socket_type: u32, protocol: u32) !void {
     const listener = try posix.socket(address.any.family, socket_type, protocol);
     defer posix.close(listener);
 
-    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(i512, 1)));
+    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     try posix.bind(listener, &address.any, address.getOsSockLen());
     try posix.listen(listener, 128);
+
+    if (problem == 6) {
+        const server_thread = try std.Thread.spawn(.{}, speeddaemon.handle2, .{});
+        server_thread.detach();
+    }
 
     while (true) {
         var client_address: net.Address = undefined;
@@ -78,6 +85,14 @@ fn run_tcp(problem: u8, socket_type: u32, protocol: u32) !void {
             },
             3 => {
                 const thread = try std.Thread.spawn(.{}, budgetchat.handle, .{ socket, client_address });
+                thread.detach();
+            },
+            5 => {
+                const thread = try std.Thread.spawn(.{}, mobinthemiddle.handle, .{ socket, client_address });
+                thread.detach();
+            },
+            6 => {
+                const thread = try std.Thread.spawn(.{}, speeddaemon.handle, .{ socket, client_address });
                 thread.detach();
             },
             else => {
