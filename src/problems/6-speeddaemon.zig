@@ -1,468 +1,503 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const net = std.net;
 const posix = std.posix;
 const math = std.math;
 
 const mnet = @import("../non-blocking-stream.zig");
 
-// TODO: Redo this shit?
+fn send_error(allocator: Allocator, w: mnet.SpeedDaemonPacketWriter, msg: []const u8) void {
+    var s = mnet.String.from_literal(allocator, msg) catch |err| {
+        std.debug.print("failed sending server error: {}\n", .{err});
+        return;
+    };
+    defer s.free();
+    w.write(mnet.Packet{
+        .ServerError = mnet.ServerError{
+            .msg = s,
+        },
+    }) catch |err| {
+        std.debug.print("failed sending server error: {}\n", .{err});
+    };
+}
 
-const Camera = struct {
-    road: u16,
-    mile: u16,
-    limit_mph: u16,
-    last_heartbeat_milliseconds: i64,
-    heartbeat_interval_deciseconds: u32,
-    r: mnet.SpeedDaemonPacketReader,
-    w: mnet.SpeedDaemonPacketWriter,
-};
-
-const Dispatcher = struct {
-    len: u8,
-    roads: [255]u16,
-    last_heartbeat_milliseconds: i64,
-    heartbeat_interval_deciseconds: u32,
-    r: mnet.SpeedDaemonPacketReader,
-    w: mnet.SpeedDaemonPacketWriter,
-};
-
-const Pending = struct {
-    last_heartbeat_milliseconds: i64,
-    heartbeat_interval_deciseconds: u32,
-    r: mnet.SpeedDaemonPacketReader,
-    w: mnet.SpeedDaemonPacketWriter,
-};
-
-const Plate = struct {
-    camera: Camera,
-    plate: mnet.ClientPlate,
-};
-
-const DayTicket = struct {
-    plate_len: u8,
-    plate: [256]u8,
-    day: u32,
-};
-
-const Server = struct {
-    cameras_len: usize = 0,
-    cameras: [2048]Camera = undefined,
+const MaxDispatchers = 4096;
+const MaxPlates = 4096;
+const MaxDayTickets = 4096;
+const MaxStoredTickets = 4096;
+const Brain = struct {
+    allocator: ?Allocator = null,
     dispatchers_len: usize = 0,
-    dispatchers: [2048]Dispatcher = undefined,
-    pending_len: usize = 0,
-    pending: [2048]Pending = undefined,
+    dispatchers: [MaxDispatchers]Dispatcher = undefined,
+    dispatchers_mutex: std.Thread.Mutex = std.Thread.Mutex{},
     plates_len: usize = 0,
-    plates: [8096]Plate = undefined,
+    plates: [MaxPlates]Plate = undefined,
+    plates_mutex: std.Thread.Mutex = std.Thread.Mutex{},
     day_tickets_len: usize = 0,
-    day_tickets: [16384]DayTicket = undefined,
-    m: std.Thread.Mutex,
+    day_tickets: [MaxDayTickets]DayTicket = undefined,
+    stored_tickets_len: usize = 0,
+    stored_tickets: [MaxStoredTickets]StoredTicket = undefined,
     const Self = @This();
-    fn create() Self {
-        return Server{
-            .m = .{},
+    fn add_dispatcher(self: *Self, dispatcher: Dispatcher) void {
+        self.dispatchers[self.dispatchers_len] = dispatcher;
+        self.dispatchers_len += 1;
+    }
+    fn add_plate(self: *Self, plate: Plate) !void {
+        self.plates[self.plates_len] = plate;
+        self.plates_len += 1;
+    }
+    fn remove_dispatcher(self: *Self, dispatcher: Dispatcher) !void {
+        if (self.dispatchers_len == 0) {
+            return error.NotFound;
+        }
+        const index = blk: {
+            for (self.dispatchers[0..self.dispatchers_len], 0..) |d, i| {
+                if (d.r.get_socket() == dispatcher.r.get_socket()) {
+                    break :blk i;
+                }
+            }
+            return error.NotFound;
         };
+
+        self.dispatchers[index].roads.free();
+        self.dispatchers[index] = self.dispatchers[self.dispatchers_len - 1];
+        self.dispatchers_len -= 1;
     }
+    fn remove_plate(self: *Self, plate: Plate) !void {
+        return try self._remove_plate(plate.plate.plate.data, plate.camera.road, plate.plate.timestamp.value);
+    }
+
+    fn _remove_plate(self: *Self, plate: []const u8, road: u16, timestamp: u32) !void {
+        if (self.plates_len == 0) {
+            return error.NotFound;
+        }
+        const index = blk: {
+            for (self.plates[0..self.plates_len], 0..) |p, i| {
+                if (!std.mem.eql(u8, p.plate.plate.data, plate)) {
+                    continue;
+                }
+                if (p.plate.timestamp.value != timestamp) {
+                    continue;
+                }
+                if (p.camera.road != road) {
+                    continue;
+                }
+
+                break :blk i;
+            }
+            return error.NotFound;
+        };
+
+        self.plates[index].plate.plate.free();
+        self.plates[index] = self.plates[self.plates_len - 1];
+        self.plates_len -= 1;
+    }
+
     fn lock(self: *Self) void {
-        self.m.lock();
+        self.dispatchers_mutex.lock();
+        self.plates_mutex.lock();
     }
+
     fn unlock(self: *Self) void {
-        self.m.unlock();
+        self.dispatchers_mutex.unlock();
+        self.plates_mutex.unlock();
     }
-    fn add(self: *Self, pending: Pending) void {
-        self.lock();
-        defer self.unlock();
-        self.pending[self.pending_len] = pending;
-        self.pending_len += 1;
-    }
+
     fn process(self: *Self) !void {
         self.lock();
         defer self.unlock();
-        var to_remove_pending_len = @as(usize, 0);
-        var to_remove_pending: [4096]usize = undefined;
-        var to_remove_cameras_len = @as(usize, 0);
-        var to_remove_cameras: [4096]usize = undefined;
-        var to_remove_dispatchers_len = @as(usize, 0);
-        var to_remove_dispatchers: [4096]usize = undefined;
-        var to_remove_plates_len = @as(usize, 0);
-        var to_remove_plates: [4096]usize = undefined;
-        for (self.pending[0..self.pending_len], 0..) |*p, i| {
-            var errored = false;
-            defer {
-                if (errored) {
-                    std.debug.print("error, disconnecting\n", .{});
-                    p.w.write(mnet.Packet{ .ServerError = mnet.ServerError{ .msg = mnet.String.from_literal("naughty naughty") } }) catch |e| {
-                        std.debug.print("failed writing error to client: {}\n", .{e});
-                    };
-                    posix.shutdown(p.r.get_socket(), .both) catch |e| {
-                        std.debug.print("failed shutting down socket (1): {}\n", .{e});
-                    };
-                    posix.close(p.r.get_socket());
-                    if (p.r.get_socket() != p.w.get_socket()) {
-                        posix.shutdown(p.w.get_socket(), .both) catch |e| {
-                            std.debug.print("failed shutting down socket (2): {}\n", .{e});
-                        };
-                        posix.close(p.w.get_socket());
-                    }
-                    to_remove_pending[to_remove_pending_len] = i;
-                    to_remove_pending_len += 1;
-                }
-            }
-            while (p.r.read()) |pkt| {
-                if (pkt) |packet| {
-                    //std.debug.print("successfully read {s}\n", .{@typeName(@TypeOf(pkt))});
-                    switch (packet) {
-                        .ClientWantHeartbeat => |impl| {
-                            if (p.heartbeat_interval_deciseconds != 0) {
-                                return error.RepeatWantHeartbeatRequests;
-                            }
-                            p.heartbeat_interval_deciseconds = impl.interval_deciseconds.value;
-                            std.debug.print("Set heartbeat interval to {} deciseconds\n", .{p.heartbeat_interval_deciseconds});
-                            break;
-                        },
-                        .ClientIAmCamera => |impl| {
-                            to_remove_pending[to_remove_pending_len] = i;
-                            to_remove_pending_len += 1;
-                            self.cameras[self.cameras_len] = Camera{
-                                .road = impl.road.value,
-                                .mile = impl.mile.value,
-                                .limit_mph = impl.limit_mph.value,
-                                .last_heartbeat_milliseconds = 0,
-                                .heartbeat_interval_deciseconds = p.heartbeat_interval_deciseconds,
-                                .r = p.r,
-                                .w = p.w,
-                            };
-                            self.cameras_len += 1;
-                            // break to allow transfer to cameras array
-                        },
-                        .ClientIAmDispatcher => |impl| {
-                            to_remove_pending[to_remove_pending_len] = i;
-                            to_remove_pending_len += 1;
+        try self.process_tickets();
+        try self.process_plates();
+    }
 
-                            var d = Dispatcher{
-                                .len = impl.roads.len,
-                                .roads = undefined,
-                                .last_heartbeat_milliseconds = 0,
-                                .heartbeat_interval_deciseconds = p.heartbeat_interval_deciseconds,
-                                .r = p.r,
-                                .w = p.w,
-                            };
-                            for (d.roads[0..d.len], impl.roads.data[0..d.len]) |*road, s| {
-                                road.* = s.value;
-                            }
-                            self.dispatchers[self.dispatchers_len] = d;
-                            self.dispatchers_len += 1;
-                            // break to allow transfer to dispatchers array
-                        },
-                        inline else => |impl| {
-                            std.debug.print("received invalid packet from pending: {s}\n", .{@typeName(@TypeOf(impl))});
-                            return error.InvalidPacket;
-                        },
-                    }
-                } else {
-                    // no more data for now
-                    break;
+    fn has_ticketed(self: Self, plate: []const u8, day_start: u32, day_end: u32) bool {
+        for (self.day_tickets[0..self.day_tickets_len]) |t| {
+            if (t.day == day_start or t.day == day_end) {
+                if (std.mem.eql(u8, t.plate.data, plate)) {
+                    return true;
                 }
-            } else |err| {
-                errored = true;
-                std.debug.print("pending: error: {}\n", .{err});
             }
         }
+        return false;
+    }
 
-        for (self.cameras[0..self.cameras_len], 0..) |*p, i| {
-            var errored = false;
-            defer {
-                if (errored) {
-                    std.debug.print("error, disconnecting\n", .{});
-                    p.w.write(mnet.Packet{ .ServerError = mnet.ServerError{ .msg = mnet.String.from_literal("naughty naughty camera") } }) catch |e| {
-                        std.debug.print("failed writing error to client: {}\n", .{e});
-                    };
-                    posix.shutdown(p.r.get_socket(), .both) catch |e| {
-                        std.debug.print("failed shutting down socket (1): {}\n", .{e});
-                    };
-                    posix.close(p.r.get_socket());
-                    if (p.r.get_socket() != p.w.get_socket()) {
-                        posix.shutdown(p.w.get_socket(), .both) catch |e| {
-                            std.debug.print("failed shutting down socket (2): {}\n", .{e});
-                        };
-                        posix.close(p.w.get_socket());
-                    }
-                    to_remove_cameras[to_remove_cameras_len] = i;
-                    to_remove_cameras_len += 1;
+    fn get_dispatcher(self: Self, road: u16) ?Dispatcher {
+        for (self.dispatchers[0..self.dispatchers_len]) |dispatcher| {
+            for (dispatcher.roads.data) |r| {
+                if (r.value == road) {
+                    return dispatcher;
                 }
-            }
-            while (p.r.read()) |pkt| {
-                if (pkt) |packet| {
-                    //std.debug.print("successfully read {s}\n", .{@typeName(@TypeOf(pkt))});
-                    switch (packet) {
-                        .ClientWantHeartbeat => |impl| {
-                            if (p.heartbeat_interval_deciseconds != 0) {
-                                return error.RepeatWantHeartbeatRequests;
-                            }
-                            p.heartbeat_interval_deciseconds = impl.interval_deciseconds.value;
-                            //std.debug.print("Set heartbeat interval to {} deciseconds\n", .{p.heartbeat_interval_deciseconds});
-                        },
-                        .ClientPlate => |impl| {
-                            var pl = Plate{
-                                .plate = mnet.ClientPlate{
-                                    .plate = mnet.String{
-                                        .len = impl.plate.len,
-                                        .data = undefined,
-                                    },
-                                    .timestamp = impl.timestamp,
-                                },
-                                .camera = p.*,
-                            };
-                            const len = pl.plate.plate.len;
-                            std.mem.copyForwards(u8, pl.plate.plate.data[0..len], impl.plate.get());
-                            self.plates[self.plates_len] = pl;
-                            self.plates_len += 1;
-                        },
-                        inline else => |impl| {
-                            std.debug.print("received invalid packet from pending: {s}\n", .{@typeName(@TypeOf(impl))});
-                            return error.InvalidPacket;
-                        },
-                    }
-                } else {
-                    // no more data for now
-                    break;
-                }
-            } else |err| {
-                errored = true;
-                std.debug.print("camera: error: {}\n", .{err});
             }
         }
+        return null;
+    }
 
-        for (self.dispatchers[0..self.dispatchers_len], 0..) |*p, i| {
-            var errored = false;
-            defer {
-                if (errored) {
-                    std.debug.print("error, disconnecting\n", .{});
-                    p.w.write(mnet.Packet{ .ServerError = mnet.ServerError{ .msg = mnet.String.from_literal("naughty naughty dispatcher") } }) catch |e| {
-                        std.debug.print("failed writing error to client: {}\n", .{e});
-                    };
-                    posix.shutdown(p.r.get_socket(), .both) catch |e| {
-                        std.debug.print("failed shutting down socket (1): {}\n", .{e});
-                    };
-                    posix.close(p.r.get_socket());
-                    if (p.r.get_socket() != p.w.get_socket()) {
-                        posix.shutdown(p.w.get_socket(), .both) catch |e| {
-                            std.debug.print("failed shutting down socket (2): {}\n", .{e});
-                        };
-                        posix.close(p.w.get_socket());
-                    }
-                    to_remove_dispatchers[to_remove_dispatchers_len] = i;
-                    to_remove_dispatchers_len += 1;
-                }
+    fn process_tickets(self: *Self) !void {
+        var to_remove: [MaxStoredTickets]usize = undefined;
+        var to_remove_len = @as(usize, 0);
+        for (self.stored_tickets[0..self.stored_tickets_len], 0..) |ticket, i| {
+            const dispatcher = if (self.get_dispatcher(ticket.packet.road.value)) |dispatcher| dispatcher else continue;
+            to_remove[to_remove_len] = i;
+            to_remove_len += 1;
+            const day_start = ticket.packet.timestamp1.value / std.time.s_per_day;
+            const day_end = ticket.packet.timestamp2.value / std.time.s_per_day;
+            if (self.has_ticketed(ticket.packet.plate.data, day_start, day_end)) {
+                continue;
             }
-            while (p.r.read()) |pkt| {
-                if (pkt) |packet| {
-                    //std.debug.print("successfully read {s}\n", .{@typeName(@TypeOf(pkt))});
-                    switch (packet) {
-                        .ClientWantHeartbeat => |impl| {
-                            if (p.heartbeat_interval_deciseconds != 0) {
-                                return error.RepeatWantHeartbeatRequests;
-                            }
-                            p.heartbeat_interval_deciseconds = impl.interval_deciseconds.value;
-                            //std.debug.print("Set heartbeat interval to {} deciseconds\n", .{p.heartbeat_interval_deciseconds});
-                        },
-                        inline else => |impl| {
-                            std.debug.print("received invalid packet from pending: {s}\n", .{@typeName(@TypeOf(impl))});
-                            return error.InvalidPacket;
-                        },
-                    }
-                } else {
-                    // no more data for now
-                    break;
-                }
-            } else |err| {
-                errored = true;
-                std.debug.print("dispatcher: error: {}\n", .{err});
-            }
-        }
 
-        {
-            var len = @as(usize, 0);
-            for (self.pending[0..self.pending_len], 0..) |p, i| {
-                const needle: [1]usize = .{i};
-                if (!std.mem.containsAtLeast(usize, to_remove_pending[0..to_remove_pending_len], 1, &needle)) {
-                    self.pending[len] = p;
-                    len += 1;
-                }
-            }
-            self.pending_len = len;
-        }
-
-        {
-            var len = @as(usize, 0);
-            for (self.cameras[0..self.cameras_len], 0..) |p, i| {
-                const needle: [1]usize = .{i};
-                if (!std.mem.containsAtLeast(usize, to_remove_cameras[0..to_remove_cameras_len], 1, &needle)) {
-                    self.cameras[len] = p;
-                    len += 1;
-                }
-            }
-            self.cameras_len = len;
-        }
-
-        {
-            var len = @as(usize, 0);
-            for (self.dispatchers[0..self.dispatchers_len], 0..) |p, i| {
-                const needle: [1]usize = .{i};
-                if (!std.mem.containsAtLeast(usize, to_remove_dispatchers[0..to_remove_dispatchers_len], 1, &needle)) {
-                    self.dispatchers[len] = p;
-                    len += 1;
-                }
-            }
-            self.dispatchers_len = len;
-        }
-
-        std.mem.sort(Plate, self.plates[0..self.plates_len], {}, struct {
-            fn lessThan(context: void, a: Plate, b: Plate) bool {
-                _ = context;
-                if (a.plate.timestamp.value == b.plate.timestamp.value) {
-                    return a.camera.mile < b.camera.mile;
-                }
-                return a.plate.timestamp.value < b.plate.timestamp.value;
-            }
-        }.lessThan);
-        for (0..self.plates_len) |i| {
-            for (i + 1..self.plates_len) |j| {
-                const a = self.plates[i];
-                const b = self.plates[j];
-                std.debug.assert(a.plate.timestamp.value <= b.plate.timestamp.value);
-                if (!std.mem.eql(u8, a.plate.plate.get(), b.plate.plate.get())) {
+            dispatcher.w.write(mnet.Packet{ .ServerTicket = ticket.packet }) catch |err| {
+                if (err == error.EOF) {
+                    std.debug.print("--dropped ticket\n", .{});
                     continue;
+                } else {
+                    return err;
                 }
+            };
+
+            for (day_start..day_end + 1) |day| {
+                var t = DayTicket{
+                    .plate = undefined,
+                    .day = @intCast(day),
+                };
+                t.plate = try mnet.String.from_literal(self.allocator.?, ticket.packet.plate.data);
+                self.day_tickets[self.day_tickets_len] = t;
+                self.day_tickets_len += 1;
+            }
+        }
+
+        var new_stored_tickets: [MaxStoredTickets]StoredTicket = undefined;
+        var new_stored_tickets_len = @as(usize, 0);
+        for (0..self.stored_tickets_len) |i| {
+            if (std.mem.indexOfScalar(usize, to_remove[0..to_remove_len], i)) |_| {
+                self.stored_tickets[i].packet.plate.free();
+                continue;
+            }
+            new_stored_tickets[new_stored_tickets_len] = self.stored_tickets[i];
+            new_stored_tickets_len += 1;
+        }
+        self.stored_tickets = new_stored_tickets;
+        self.stored_tickets_len = new_stored_tickets_len;
+    }
+
+    fn process_plates(self: *Self) !void {
+        std.mem.sort(Plate, self.plates[0..self.plates_len], {}, Plate.less_than);
+        var to_remove: [MaxPlates]usize = undefined;
+        var to_remove_len = @as(usize, 0);
+        for (0..self.plates_len) |i| {
+            const a = self.plates[i];
+            const day_start = a.plate.timestamp.value / std.time.s_per_day;
+            if (self.has_ticketed(a.plate.plate.data, day_start, day_start)) {
+                to_remove[to_remove_len] = i;
+                to_remove_len += 1;
+                continue;
+            }
+            //if (a.used) {
+            //    continue;
+            //}
+            for (i + 1..self.plates_len) |j| {
+                const b = self.plates[j];
+                //if (b.used) {
+                //    continue;
+                //}
 
                 if (a.camera.road != b.camera.road) {
                     continue;
                 }
 
+                if (a.camera.mile == b.camera.mile) {
+                    continue;
+                }
+
+                if (!std.mem.eql(u8, a.plate.plate.data, b.plate.plate.data)) {
+                    continue;
+                }
+
                 const time_between_seconds: f64 = @floatFromInt(try math.sub(u32, b.plate.timestamp.value, a.plate.timestamp.value));
-                const distance_between_miles: f64 = @floatFromInt(math.sub(u16, b.camera.mile, a.camera.mile) catch
-                    try math.sub(u16, a.camera.mile, b.camera.mile));
-                if (distance_between_miles == 0) {
-                    //std.debug.print("distance is 0\n", .{});
+                const time_between_hours: f64 = time_between_seconds / 3600.0;
+                const distance_between_miles: f64 = @floatFromInt(math.sub(u32, a.camera.mile, b.camera.mile) catch try math.sub(u32, b.camera.mile, a.camera.mile));
+                const mph: f64 = distance_between_miles / time_between_hours;
+                if (mph > 655.35) {
                     continue;
                 }
-                const day_start = a.plate.timestamp.value / std.time.s_per_day;
-                const day_end = b.plate.timestamp.value / std.time.s_per_day;
+                const speed_100mph: u16 = @intFromFloat(mph * 100);
 
-                //if (day_start != day_end) {
-                //continue;
-                //}
-
-                std.debug.assert(a.camera.limit_mph == b.camera.limit_mph);
-                std.debug.assert(time_between_seconds > 0);
-                const time_between_hours = time_between_seconds / 3600.0;
-                //std.debug.print("tbh: {}, dbm: {}\n", .{ time_between_hours, distance_between_miles });
-                const asdf = (distance_between_miles / time_between_hours) * 100.0;
-                if (asdf > 65535.0) {
+                if (speed_100mph <= a.camera.limit_mph * 100) {
                     continue;
                 }
-                const mph: u16 = @intFromFloat(asdf);
-                //std.debug.print("mph = {}\n", .{mph});
-                if (mph > b.camera.limit_mph * 100) {
-                    //std.debug.print("day {} -> {}\n", .{ day_start, day_end });
-                    const already_ticketed = blk: {
-                        for (self.day_tickets[0..self.day_tickets_len]) |t| {
-                            //std.debug.print("ticket on day {} for {s}\n", .{ t.day, t.plate[0..t.plate_len] });
-                            if (t.day >= day_start and t.day <= day_end) {
-                                if (std.mem.eql(u8, t.plate[0..t.plate_len], a.plate.plate.get())) {
-                                    break :blk true;
-                                }
-                            }
-                        }
-                        break :blk false;
-                    };
-                    if (already_ticketed) {
-                        //std.debug.print("already ticketed\n", .{});
-                        continue;
-                    }
-                    //std.debug.print("TICKETING {s} on day(s) {} -> {}\n", .{ a.plate.plate.get(), day_start, day_end });
 
-                    const dispatcher = blk: {
-                        for (self.dispatchers[0..self.dispatchers_len]) |d| {
-                            for (d.roads[0..d.len]) |road| {
-                                if (road == a.camera.road) {
-                                    break :blk d;
-                                }
-                            }
-                        }
-                        //std.debug.print("no matching dispatcher yet\n", .{});
-                        //return error.NoMatchingDispatcherYet;
-                        continue;
-                    };
+                const ticket = mnet.ServerTicket{
+                    .mile1 = mnet.UInt16{ .value = a.camera.mile },
+                    .timestamp1 = mnet.UInt32{ .value = a.plate.timestamp.value },
+                    .mile2 = mnet.UInt16{ .value = b.camera.mile },
+                    .timestamp2 = mnet.UInt32{ .value = b.plate.timestamp.value },
+                    .road = mnet.UInt16{ .value = a.camera.road },
+                    .plate = try a.plate.plate.clone(self.allocator.?),
+                    .speed_100mph = mnet.UInt16{ .value = speed_100mph },
+                };
 
-                    // make sure to remove even if dispatcher disconnects, maybe?
-                    to_remove_plates[to_remove_plates_len] = i;
-                    to_remove_plates_len += 1;
-                    to_remove_plates[to_remove_plates_len] = j;
-                    to_remove_plates_len += 1;
-
-                    dispatcher.w.write(mnet.Packet{ .ServerTicket = mnet.ServerTicket{
-                        .road = mnet.UInt16{ .value = a.camera.road },
-                        .plate = a.plate.plate,
-                        .mile1 = mnet.UInt16{ .value = a.camera.mile },
-                        .mile2 = mnet.UInt16{ .value = b.camera.mile },
-                        .timestamp1 = a.plate.timestamp,
-                        .timestamp2 = b.plate.timestamp,
-                        .speed_100mph = mnet.UInt16{ .value = mph },
-                    } }) catch {
-                        continue;
-                    };
-
-                    for (day_start..day_end + 1) |day| {
-                        const len = a.plate.plate.len;
-                        var day_ticket = DayTicket{
-                            .plate_len = len,
-                            .plate = undefined,
-                            .day = @intCast(day),
-                        };
-                        std.mem.copyForwards(u8, day_ticket.plate[0..len], a.plate.plate.get());
-                        self.day_tickets[self.day_tickets_len] = day_ticket;
-                        self.day_tickets_len += 1;
-                    }
-                }
+                self.stored_tickets[self.stored_tickets_len] = StoredTicket{ .road = ticket.road.value, .packet = ticket };
+                self.stored_tickets_len += 1;
             }
         }
 
-        {
-            var len = @as(usize, 0);
-            for (self.plates[0..self.plates_len], 0..) |p, i| {
-                const needle: [1]usize = .{i};
-                if (!std.mem.containsAtLeast(usize, to_remove_plates[0..to_remove_plates_len], 1, &needle)) {
-                    self.plates[len] = p;
-                    len += 1;
-                }
-            }
-            self.plates_len = len;
-        }
-
-        try heartbeat(&self.pending, self.pending_len);
-        try heartbeat(&self.cameras, self.cameras_len);
-        try heartbeat(&self.dispatchers, self.dispatchers_len);
-
-        //std.debug.print("num pending: {}\n", .{self.pending_len});
-        //std.debug.print("num cameras: {}\n", .{self.cameras_len});
-        //std.debug.print("num dispatchers: {}\n", .{self.dispatchers_len});
-    }
-    fn heartbeat(items: anytype, len: usize) !void {
-        const now = std.time.milliTimestamp();
-        for (items[0..len]) |*item| {
-            if (item.heartbeat_interval_deciseconds == 0) {
+        var new_plates: [MaxPlates]Plate = undefined;
+        var new_plates_len = @as(usize, 0);
+        for (0..self.plates_len) |i| {
+            if (std.mem.indexOfScalar(usize, to_remove[0..to_remove_len], i)) |_| {
+                self.plates[i].plate.plate.free();
                 continue;
             }
+            new_plates[new_plates_len] = self.plates[i];
+            new_plates_len += 1;
+        }
+        self.plates = new_plates;
+        self.plates_len = new_plates_len;
+    }
+};
+var brain: Brain = Brain{};
 
-            if (now - item.last_heartbeat_milliseconds > item.heartbeat_interval_deciseconds * 100) {
-                try item.w.write(mnet.Packet{ .ServerHeartbeat = mnet.ServerHeartbeat{} });
-                @field(@constCast(item), "last_heartbeat_milliseconds") = now;
-            }
+const Client = union(enum) {
+    Pending: Pending,
+    Camera: Camera,
+    Dispatcher: Dispatcher,
+    const Self = @This();
+    fn process(self: *Self) !Client {
+        switch (self.*) {
+            inline else => |*impl| {
+                self.* = try impl.process();
+                return self.*;
+            },
+        }
+    }
+    fn heartbeat(self: *Self) !Client {
+        switch (self.*) {
+            inline else => |*impl| {
+                if (impl.heartbeat_interval_deciseconds != 0) {
+                    self.* = try impl.heartbeat();
+                }
+                return self.*;
+            },
         }
     }
 };
 
-var server = Server.create();
+const Pending = struct {
+    last_heartbeat_milliseconds: i64 = 0,
+    heartbeat_interval_deciseconds: u32 = 0,
+    heartbeat_has_been_set: bool = false,
+    m: *std.Thread.Mutex,
+    r: mnet.SpeedDaemonPacketReader,
+    w: mnet.SpeedDaemonPacketWriter,
+    const Self = @This();
+    fn process(self: *Self) !Client {
+        self.m.lock();
+        defer self.m.unlock();
+        var slf = self;
+        errdefer |err| {
+            std.debug.print("pending error: {}\n", .{err});
+            send_error(brain.allocator.?, slf.w, "bad stuff");
+        }
+        while (try slf.r.read(brain.allocator.?)) |packet| {
+            switch (packet) {
+                .ClientWantHeartbeat => |p| {
+                    if (slf.heartbeat_has_been_set) {
+                        return error.HeartbeatAlreadySet;
+                    }
+                    slf.heartbeat_has_been_set = true;
+                    slf.heartbeat_interval_deciseconds = p.interval_deciseconds.value;
+                },
+                .ClientIAmCamera => |p| {
+                    return (Camera{
+                        .road = p.road.value,
+                        .mile = p.mile.value,
+                        .limit_mph = p.limit_mph.value,
+                        .heartbeat_has_been_set = slf.heartbeat_has_been_set,
+                        .last_heartbeat_milliseconds = slf.last_heartbeat_milliseconds,
+                        .heartbeat_interval_deciseconds = slf.heartbeat_interval_deciseconds,
+                        .m = slf.m,
+                        .r = slf.r,
+                        .w = slf.w,
+                    }).client();
+                },
+                .ClientIAmDispatcher => |p| {
+                    var d = Dispatcher{
+                        .roads = p.roads,
+                        .heartbeat_has_been_set = slf.heartbeat_has_been_set,
+                        .last_heartbeat_milliseconds = slf.last_heartbeat_milliseconds,
+                        .heartbeat_interval_deciseconds = slf.heartbeat_interval_deciseconds,
+                        .m = slf.m,
+                        .r = slf.r,
+                        .w = slf.w,
+                    };
+                    brain.add_dispatcher(d);
+                    return d.client();
+                },
+                else => {
+                    return error.InvalidPacketType;
+                },
+            }
+        }
+
+        return slf.client();
+    }
+    fn heartbeat(self: *Self) !Client {
+        self.m.lock();
+        defer self.m.unlock();
+        var slf = self;
+        const now = std.time.milliTimestamp();
+        if (now - slf.last_heartbeat_milliseconds > slf.heartbeat_interval_deciseconds * 100) {
+            try slf.w.write(mnet.Packet{ .ServerHeartbeat = mnet.ServerHeartbeat{} });
+            slf.last_heartbeat_milliseconds = now;
+        }
+        return slf.client();
+    }
+    fn client(self: Self) Client {
+        return Client{ .Pending = self };
+    }
+};
+
+const Camera = struct {
+    road: u16,
+    mile: u16,
+    limit_mph: u16,
+    heartbeat_has_been_set: bool,
+    last_heartbeat_milliseconds: i64,
+    heartbeat_interval_deciseconds: u32,
+    m: *std.Thread.Mutex,
+    r: mnet.SpeedDaemonPacketReader,
+    w: mnet.SpeedDaemonPacketWriter,
+    const Self = @This();
+    fn process(self: *Self) !Client {
+        self.m.lock();
+        defer self.m.unlock();
+        var slf = self;
+        errdefer |err| {
+            if (err != error.ConnectionResetByPeer) {
+                if (err != error.EOF) {
+                    std.debug.print("camera error: {}\n", .{err});
+                }
+                send_error(brain.allocator.?, slf.w, "bad stuff");
+            }
+        }
+        while (try slf.r.read(brain.allocator.?)) |packet| {
+            switch (packet) {
+                .ClientWantHeartbeat => |p| {
+                    if (slf.heartbeat_has_been_set) {
+                        return error.HeartbeatAlreadySet;
+                    }
+                    slf.heartbeat_has_been_set = true;
+                    slf.heartbeat_interval_deciseconds = p.interval_deciseconds.value;
+                },
+                .ClientPlate => |p| {
+                    brain.plates_mutex.lock();
+                    defer brain.plates_mutex.unlock();
+                    try brain.add_plate(Plate{
+                        .plate = p,
+                        .camera = slf.*,
+                    });
+                },
+                else => {
+                    return error.InvalidPacketType;
+                },
+            }
+        }
+
+        return slf.client();
+    }
+    fn heartbeat(self: *Self) !Client {
+        self.m.lock();
+        defer self.m.unlock();
+        var slf = self;
+        const now = std.time.milliTimestamp();
+        if (now - slf.last_heartbeat_milliseconds > slf.heartbeat_interval_deciseconds * 100) {
+            try slf.w.write(mnet.Packet{ .ServerHeartbeat = mnet.ServerHeartbeat{} });
+            slf.last_heartbeat_milliseconds = now;
+        }
+        return slf.client();
+    }
+    fn client(self: Self) Client {
+        return Client{ .Camera = self };
+    }
+};
+
+const Dispatcher = struct {
+    roads: mnet.UInt16Array,
+    heartbeat_has_been_set: bool,
+    last_heartbeat_milliseconds: i64,
+    heartbeat_interval_deciseconds: u32,
+    m: *std.Thread.Mutex,
+    r: mnet.SpeedDaemonPacketReader,
+    w: mnet.SpeedDaemonPacketWriter,
+    const Self = @This();
+    fn free(self: *Self) void {
+        self.allocator.free(self.roads);
+    }
+    fn process(self: *Self) !Client {
+        self.m.lock();
+        defer self.m.unlock();
+        var slf = self;
+        errdefer |err| {
+            if (err != error.EOF) {
+                brain.dispatchers_mutex.lock();
+                std.debug.print("dispatcher error: {}\n", .{err});
+                if (err != error.ConnectionResetByPeer) {
+                    send_error(brain.allocator.?, slf.w, "bad stuff");
+                }
+                brain.remove_dispatcher(self.*) catch {};
+                brain.dispatchers_mutex.unlock();
+            }
+        }
+        while (try slf.r.read(brain.allocator.?)) |packet| {
+            switch (packet) {
+                .ClientWantHeartbeat => |p| {
+                    if (slf.heartbeat_has_been_set) {
+                        return error.HeartbeatAlreadySet;
+                    }
+                    slf.heartbeat_has_been_set = true;
+                    slf.heartbeat_interval_deciseconds = p.interval_deciseconds.value;
+                },
+                else => {
+                    return error.InvalidPacketType;
+                },
+            }
+        }
+
+        return slf.client();
+    }
+    fn heartbeat(self: *Self) !Client {
+        self.m.lock();
+        defer self.m.unlock();
+        var slf = self;
+        const now = std.time.milliTimestamp();
+        if (now - slf.last_heartbeat_milliseconds > slf.heartbeat_interval_deciseconds * 100) {
+            try slf.w.write(mnet.Packet{ .ServerHeartbeat = mnet.ServerHeartbeat{} });
+            slf.last_heartbeat_milliseconds = now;
+        }
+        return slf.client();
+    }
+    fn client(self: Self) Client {
+        return Client{ .Dispatcher = self };
+    }
+};
+
+const Plate = struct {
+    camera: Camera,
+    plate: mnet.ClientPlate,
+    fn less_than(ctx: void, a: Plate, b: Plate) bool {
+        _ = ctx;
+        return a.plate.timestamp.value < b.plate.timestamp.value;
+    }
+};
+
+const DayTicket = struct {
+    plate: mnet.String,
+    day: u32,
+};
+
+const StoredTicket = struct {
+    road: u16,
+    packet: mnet.ServerTicket,
+};
 
 pub fn handle(socket: posix.socket_t, _: net.Address) !void {
     const timeout = posix.timeval{ .tv_sec = 0, .tv_usec = std.time.us_per_ms * 1 };
@@ -471,12 +506,40 @@ pub fn handle(socket: posix.socket_t, _: net.Address) !void {
 
     const r = try mnet.SpeedDaemonPacketReader.create(socket);
     const w = try mnet.SpeedDaemonPacketWriter.create(socket);
-    server.add(Pending{ .r = r, .w = w, .last_heartbeat_milliseconds = 0, .heartbeat_interval_deciseconds = 0 });
+    var m = std.Thread.Mutex{};
+    var client = (Pending{ .r = r, .w = w, .m = &m }).client();
+
+    while (true) {
+        if (brain.allocator == null) {
+            continue;
+        }
+        client = client.process() catch |err| switch (err) {
+            error.EOF => {
+                //std.debug.print("process: EOF\n", .{});
+                break;
+            },
+            else => return err,
+        };
+        client = client.heartbeat() catch |err| switch (err) {
+            error.EOF => {
+                //std.debug.print("heartbeat: EOF\n", .{});
+                break;
+            },
+            else => return err,
+        };
+    }
 }
 
 pub fn handle2() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    {
+        brain.lock();
+        defer brain.unlock();
+        brain.allocator = gpa.allocator();
+    }
     while (true) {
-        try server.process();
-        std.time.sleep(std.time.ns_per_us * 50);
+        try brain.process();
+        std.time.sleep(std.time.ns_per_ms * 1000);
     }
 }

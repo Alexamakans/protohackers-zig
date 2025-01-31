@@ -37,7 +37,8 @@ pub const Writer = union(enum) {
     pub fn writeAtLeast(self: Self, data: []const u8, len: usize) !usize {
         var n = @as(usize, 0);
         while (n < len and n != data.len) {
-            n += try self.write(data[n..]);
+            const _n = try self.write(data[n..]);
+            n += _n;
             std.time.sleep(1);
         }
         return n;
@@ -73,10 +74,8 @@ pub const SocketReader = struct {
             },
         };
         if (n == 0) {
-            //std.debug.print("SocketReader: n == 0, closed\n", .{});
             return error.EOF;
         }
-        //std.debug.print("read: '0x{}'\n", .{std.fmt.fmtSliceHexLower(buf[0..n])});
         return n;
     }
 };
@@ -91,7 +90,6 @@ pub const SocketWriter = struct {
     }
 
     pub fn write(self: Self, data: []const u8) !usize {
-        //std.debug.print("writing: '{s}'\n", .{std.fmt.fmtSliceHexLower(data)});
         const n = posix.write(self.socket, data) catch |err| switch (err) {
             error.WouldBlock => {
                 return 0;
@@ -116,8 +114,8 @@ pub const SpeedDaemonPacketReader = struct {
         };
     }
 
-    pub fn read(self: Self) !?Packet {
-        return try Packet.from(self.r);
+    pub fn read(self: Self, allocator: Allocator) !?Packet {
+        return try Packet.from(allocator, self.r);
     }
     pub fn get_socket(self: Self) posix.socket_t {
         return switch (self.r) {
@@ -129,6 +127,7 @@ pub const SpeedDaemonPacketReader = struct {
 
 pub const SpeedDaemonPacketWriter = struct {
     w: Writer,
+    m: std.Thread.Mutex = std.Thread.Mutex{},
     const Self = @This();
     pub fn create(socket: posix.socket_t) !Self {
         return SpeedDaemonPacketWriter{
@@ -147,53 +146,64 @@ pub const SpeedDaemonPacketWriter = struct {
 };
 
 pub const String = struct {
-    len: u8,
-    data: [255]u8,
+    allocator: Allocator,
+    data: []u8,
     const Self = @This();
-    pub fn from_literal(data: []const u8) String {
-        var result = String{
-            .len = @intCast(data.len),
-            .data = undefined,
+    pub fn free(self: *Self) void {
+        self.allocator.free(self.data);
+    }
+    pub fn clone(self: Self, allocator: Allocator) !String {
+        return String.from_literal(allocator, self.data);
+    }
+    pub fn from_literal(allocator: Allocator, data: []const u8) !String {
+        std.debug.assert(data.len > 0 and data.len <= 256);
+        const result = String{
+            .allocator = allocator,
+            .data = try allocator.alloc(u8, data.len),
         };
-        for (result.data[0..data.len], data) |*d, s| {
-            d.* = s;
-        }
+        @memcpy(result.data, data);
         return result;
     }
-    pub fn get(self: Self) []const u8 {
-        return self.data[0..self.len];
-    }
     fn write(self: Self, w: Writer) !void {
-        _ = try w.writeAll(&std.mem.toBytes(self.len));
-        _ = try w.writeAll(self.data[0..self.len]);
-        std.debug.print("String: '{s}'\n", .{self.get()});
+        const len: u8 = @truncate(self.data.len);
+        _ = try w.writeAll(&std.mem.toBytes(len));
+        _ = try w.writeAll(self.data);
     }
-    fn from(r: Reader) !Self {
-        var result = String{ .len = 0, .data = undefined };
+    fn from(allocator: Allocator, r: Reader) !Self {
         var len_buf: [1]u8 = undefined;
         _ = try r.readAll(&len_buf);
-        result.len = len_buf[0];
-        _ = try r.readAll(result.data[0..result.len]);
+        const result = String{
+            .allocator = allocator,
+            .data = try allocator.alloc(u8, len_buf[0]),
+        };
+        _ = try r.readAll(result.data);
         return result;
     }
 };
 
 pub const UInt16Array = struct {
-    len: u8,
-    data: [255]UInt16,
+    allocator: Allocator,
+    data: []UInt16,
     const Self = @This();
+    pub fn free(self: *Self) void {
+        self.allocator.free(self.data);
+    }
     fn write(self: Self, w: Writer) !void {
-        _ = try w.writeAll(&std.mem.toBytes(self.len));
+        const len: u8 = @truncate(self.data.len);
+        _ = try w.writeAll(&std.mem.toBytes(len));
         for (self.data) |e| {
             try e.write(w);
         }
     }
-    fn from(r: Reader) !Self {
-        var result = UInt16Array{ .len = 0, .data = undefined };
+    fn from(allocator: Allocator, r: Reader) !Self {
         var len_buf: [1]u8 = undefined;
         _ = try r.readAll(&len_buf);
-        result.len = len_buf[0];
-        for (0..result.len) |i| {
+        //std.debug.assert(len_buf[0] > 0);
+        var result = UInt16Array{
+            .allocator = allocator,
+            .data = try allocator.alloc(UInt16, len_buf[0]),
+        };
+        for (0..result.data.len) |i| {
             result.data[i] = try UInt16.from(r);
         }
         return result;
@@ -300,39 +310,43 @@ pub const Packet = union(enum) {
     ClientIAmCamera: ClientIAmCamera,
     ClientIAmDispatcher: ClientIAmDispatcher,
     const Self = @This();
-    pub fn from(r: Reader) !?Self {
+    pub fn from(allocator: Allocator, r: Reader) !?Self {
         var packet_type: [1]u8 = undefined;
         const n = try r.read(&packet_type);
         if (n == 0) {
             return null;
         }
         switch (packet_type[0]) {
-            0x20 => return Packet{ .ClientPlate = try Packet._read(r, ClientPlate) },
-            0x40 => return Packet{ .ClientWantHeartbeat = try Packet._read(r, ClientWantHeartbeat) },
-            0x80 => return Packet{ .ClientIAmCamera = try Packet._read(r, ClientIAmCamera) },
-            0x81 => return Packet{ .ClientIAmDispatcher = try Packet._read(r, ClientIAmDispatcher) },
+            0x20 => return Packet{ .ClientPlate = try Packet._read(allocator, r, ClientPlate) },
+            0x40 => return Packet{ .ClientWantHeartbeat = try Packet._read(allocator, r, ClientWantHeartbeat) },
+            0x80 => return Packet{ .ClientIAmCamera = try Packet._read(allocator, r, ClientIAmCamera) },
+            0x81 => return Packet{ .ClientIAmDispatcher = try Packet._read(allocator, r, ClientIAmDispatcher) },
             else => {
                 std.debug.print("received invalid packet: {}\n", .{packet_type[0]});
                 return error.EOF;
             },
         }
     }
-    fn _read(r: Reader, comptime T: type) !T {
+    fn _read(allocator: Allocator, r: Reader, comptime T: type) !T {
         var result: T = undefined;
         switch (@typeInfo(T)) {
             .Struct => |info| {
-                std.debug.print("reading struct {s}\n", .{@typeName(T)});
                 const fields = info.fields;
                 inline for (fields) |field| {
                     if (!std.mem.eql(u8, field.name, "id")) {
-                        //std.debug.print("reading field {s}\n", .{field.name});
-                        @field(result, field.name) = try field.type.from(r);
+                        switch (field.type) {
+                            String, UInt16Array => {
+                                @field(result, field.name) = try field.type.from(allocator, r);
+                            },
+                            else => {
+                                @field(result, field.name) = try field.type.from(r);
+                            },
+                        }
                     }
                 }
             },
             else => return error.InvalidType,
         }
-        //std.debug.print("returning {}\n", .{result});
         return result;
     }
     fn write(self: Self, w: Writer) !void {
@@ -341,7 +355,6 @@ pub const Packet = union(enum) {
                 const T = @TypeOf(impl);
                 switch (@typeInfo(T)) {
                     .Struct => |info| {
-                        std.debug.print("writing struct {s}\n", .{@typeName(T)});
                         const fields = info.fields;
                         inline for (fields) |field| {
                             try @field(impl, field.name).write(w);
