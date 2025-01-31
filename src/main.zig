@@ -14,6 +14,7 @@ const budgetchat = @import("problems/3-budgetchat.zig");
 const unusualdatabaseprogram = @import("problems/4-unusualdatabaseprogram.zig");
 const mobinthemiddle = @import("problems/5-mobinthemiddle.zig");
 const speeddaemon = @import("problems/6-speeddaemon.zig");
+const linereversal = @import("problems/7-linereversal.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -39,10 +40,13 @@ pub fn main() !void {
 }
 
 fn run(problem: u8) !void {
-    if (problem <= 3 or problem >= 5) {
-        try run_tcp(problem, posix.SOCK.STREAM, posix.IPPROTO.TCP);
-    } else {
-        try run_udp(problem, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+    switch (problem) {
+        0, 1, 2, 3, 5, 6 => {
+            try run_tcp(problem, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+        },
+        else => {
+            try run_udp(problem, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+        },
     }
 }
 
@@ -115,6 +119,9 @@ fn run_udp(problem: u8, socket_type: u32, protocol: u32) !void {
     switch (problem) {
         4 => {
             try unusualdatabaseprogram.handle(socket);
+        },
+        7 => {
+            try linereversal.handle(socket);
         },
         else => {
             std.debug.print("{} is not implemented in main yet", .{problem});
