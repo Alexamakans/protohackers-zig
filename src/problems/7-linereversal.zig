@@ -24,9 +24,13 @@ const Session = struct {
     sent: u32 = 0,
     awaiting_ack: bool = false,
 
-    line_buf_start: usize = 0,
-    line_buf_pos: usize = 0,
-    line_buf: [16384]u8 = undefined,
+    buf_start: usize = 0,
+    buf_pos: usize = 0,
+    buf: [16384]u8 = undefined,
+
+    line_send_buf_len: usize = 0,
+    line_send_buf_pos: usize = 0,
+    line_send_buf: [12000]u8 = undefined,
 
     const Self = @This();
     fn init(allocator: Allocator, socket: posix.socket_t, addr: net.Address) Self {
@@ -39,18 +43,17 @@ const Session = struct {
         };
     }
 
-    // TODO: integrate with DelimitedReader or something?
-    //       this guy handles the protocol, some reader/writer should just get the data
-    //       part
-
-    //fn get_line(self: *Self) ?[]u8 {
-    //    if (std.mem.indexOfScalar(u8, self.line_buf[0..self.line_buf_len], '\n')) |i| {
-    //        const res = self.line_buf[0..i];
-    //        self.line_buf_pos = i - res.len;
-    //        self.line_buf_start = i;
-    //        return res;
-    //    }
-    //}
+    fn get_line(self: *Self) ?[]u8 {
+        if (self.buf_start >= self.buf_pos) {
+            return null;
+        }
+        if (std.mem.indexOfScalar(u8, self.buf[self.buf_start..self.buf_pos], '\n')) |i| {
+            const res = self.buf[self.buf_start..i];
+            self.buf_start += i + 1;
+            return res;
+        }
+        return null;
+    }
     fn deinit(self: *Self) void {
         _ = self;
         // no-op
@@ -60,6 +63,19 @@ const Session = struct {
             if (self.should_resend()) {
                 try self.send_data(self.send_buf[0..self.send_buf_len]);
                 return;
+            }
+        }
+
+        if (!self.awaiting_ack) {
+            if (self.line_send_buf_len > 0) {
+                const remaining = try math.sub(usize, self.line_send_buf_len, self.line_send_buf_pos);
+                const len = if (remaining > 800) 800 else remaining;
+                try self.send_data(self.line_send_buf[self.line_send_buf_pos .. self.line_send_buf_pos + len]);
+                self.line_send_buf_pos += len;
+                if (len == remaining) {
+                    self.line_send_buf_len = 0;
+                    self.line_send_buf_pos = 0;
+                }
             }
         }
 
@@ -96,9 +112,12 @@ const Session = struct {
             self.received += @intCast(d.len);
             try self.send_ack(self.received);
 
-            // Reversal
-            std.mem.reverse(u8, d);
-            try self.send_data(d);
+            if (self.buf.len - self.buf_pos < 10000) {
+                std.mem.copyForwards(u8, self.buf[0..], self.buf[self.buf_start..self.buf_pos]);
+                self.buf_pos -= self.buf_start;
+                self.buf_start = 0;
+            }
+            @memcpy(self.buf[self.buf_pos .. self.buf_pos + d.len], d);
         } else if (std.mem.eql(u8, packet_type, "ack")) {
             if (!self.connected) {
                 try self.send_close();
@@ -159,11 +178,22 @@ const Session = struct {
         if (written != buf.len) {
             return error.IncompleteSend;
         }
+        self.awaiting_ack = true;
         std.debug.print("--> {s}\n", .{buf});
     }
     fn should_resend(self: *Self) bool {
         const now = std.time.timestamp();
         return now - self.last_data_send_timestamp >= self.retransmission_timeout;
+    }
+    fn send_line(self: *Self, data: []const u8) !void {
+        if (self.line_send_buf_len > 0) {
+            return error.Busy;
+        }
+
+        @memcpy(self.line_send_buf[0..data.len], data);
+        self.line_send_buf[data.len] = '\n';
+        self.line_send_buf_len = data.len + 1;
+        self.line_send_buf_pos = 0;
     }
 };
 
@@ -194,6 +224,13 @@ pub fn handle(socket: posix.socket_t) !void {
         session.handle(buf[0..n]) catch |err| {
             std.debug.print("session '{}' error: {}\n", .{ session.id, err });
         };
+
+        if (session.get_line()) |line| {
+            std.mem.reverse(u8, line);
+            session.send_line(line) catch |err| if (err != error.Busy) {
+                std.debug.print("error sending line: {}\n", .{err});
+            };
+        }
     }
 }
 
