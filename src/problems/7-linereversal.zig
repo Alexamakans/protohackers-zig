@@ -8,28 +8,191 @@ const Allocator = std.mem.Allocator;
 const TokenIterator = std.mem.TokenIterator(u8, .scalar);
 
 const Session = struct {
-    ip: net.Address,
-    port: u16,
+    allocator: Allocator,
+    socket: posix.socket_t,
+    addr: net.Address,
+    last_data_send_timestamp: i64,
+    last_ack_timestamp: i64,
+    id: u32 = 0,
+    connected: bool = false,
+    send_buf_len: usize = 0,
+    send_buf: [1000]u8 = undefined,
+    retransmission_timeout: i64 = std.time.ns_per_s * 3,
+    session_expiry_timeout: i64 = std.time.ns_per_s * 60,
+    received: u32 = 0,
+    sent_data_len: usize = 0,
+    sent: u32 = 0,
+    awaiting_ack: bool = false,
+
+    line_buf_start: usize = 0,
+    line_buf_pos: usize = 0,
+    line_buf: [16384]u8 = undefined,
+
+    const Self = @This();
+    fn init(allocator: Allocator, socket: posix.socket_t, addr: net.Address) Self {
+        return Session{
+            .allocator = allocator,
+            .socket = socket,
+            .addr = addr,
+            .last_ack_timestamp = std.time.timestamp(),
+            .last_data_send_timestamp = std.time.timestamp(),
+        };
+    }
+
+    // TODO: integrate with DelimitedReader or something?
+    //       this guy handles the protocol, some reader/writer should just get the data
+    //       part
+
+    //fn get_line(self: *Self) ?[]u8 {
+    //    if (std.mem.indexOfScalar(u8, self.line_buf[0..self.line_buf_len], '\n')) |i| {
+    //        const res = self.line_buf[0..i];
+    //        self.line_buf_pos = i - res.len;
+    //        self.line_buf_start = i;
+    //        return res;
+    //    }
+    //}
+    fn deinit(self: *Self) void {
+        _ = self;
+        // no-op
+    }
+    fn handle(self: *Self, data: []const u8) !void {
+        if (self.awaiting_ack) {
+            if (self.should_resend()) {
+                try self.send_data(self.send_buf[0..self.send_buf_len]);
+                return;
+            }
+        }
+
+        var token_list = try tokenize(self.allocator, data);
+        defer token_list.deinit();
+
+        const packet_type: []const u8 = token_list.tokens[0].?.data;
+        std.debug.print("<-- {s}\n", .{data});
+        if (std.mem.eql(u8, packet_type, "connect")) {
+            const id_str = token_list.tokens[1].?.data;
+            self.id = try std.fmt.parseInt(@TypeOf(self.id), id_str, 0);
+            try self.send_ack(0);
+            self.connected = true;
+            return;
+        } else if (std.mem.eql(u8, packet_type, "close")) {
+            try self.send_close();
+            return;
+        } else if (std.mem.eql(u8, packet_type, "data")) {
+            if (!self.connected) {
+                try self.send_close();
+                return error.NotConnected;
+            }
+
+            const pos = try std.fmt.parseInt(u32, token_list.tokens[2].?.data, 0);
+            if (self.received < pos) {
+                try self.send_ack(self.received);
+                return;
+            }
+            if (self.received > pos) {
+                return;
+            }
+            const d = try unescape(self.allocator, token_list.tokens[3].?.data);
+            defer self.allocator.free(d);
+            self.received += @intCast(d.len);
+            try self.send_ack(self.received);
+
+            // Reversal
+            std.mem.reverse(u8, d);
+            try self.send_data(d);
+        } else if (std.mem.eql(u8, packet_type, "ack")) {
+            if (!self.connected) {
+                try self.send_close();
+                return error.NotConnected;
+            }
+
+            const length = try std.fmt.parseInt(u32, token_list.tokens[2].?.data, 0);
+            if (length <= self.received) {
+                return;
+            }
+            if (length > self.sent) {
+                if (length == self.sent + self.sent_data_len) {
+                    self.sent = length;
+                    self.awaiting_ack = false;
+                } else {
+                    try self.send_close();
+                    return error.BadClient;
+                }
+            }
+            if (length == self.sent) {
+                try self.send_data(self.send_buf[0..self.send_buf_len]);
+            }
+        } else {
+            std.debug.print("'{}' sent unexpected packet type: '{s}'\n", .{ self.id, packet_type });
+        }
+    }
+    fn send_ack(self: *Self, length: u32) !void {
+        const buf = try std.fmt.bufPrint(&self.send_buf, "/ack/{}/{}/", .{ self.id, length });
+        self.send_buf_len = buf.len;
+        const written = try posix.sendto(self.socket, buf, 0, &self.addr.any, @sizeOf(net.Address));
+        if (written != buf.len) {
+            return error.IncompleteSend;
+        }
+        std.debug.print("--> {s}\n", .{buf});
+    }
+    fn send_close(self: *Self) !void {
+        const buf = try std.fmt.bufPrint(&self.send_buf, "/close/{}/", .{self.id});
+        self.send_buf_len = buf.len;
+        const written = try posix.sendto(self.socket, buf, 0, &self.addr.any, @sizeOf(net.Address));
+        if (written != buf.len) {
+            return error.IncompleteSend;
+        }
+        std.debug.print("--> {s}\n", .{buf});
+    }
+    fn send_data(self: *Self, data: []const u8) !void {
+        const now = std.time.timestamp();
+        if (now - self.last_ack_timestamp > self.session_expiry_timeout) {
+            try self.send_close();
+            return error.Timeout;
+        }
+
+        self.last_data_send_timestamp = now;
+        const escaped = try escape(self.allocator, data);
+        defer self.allocator.free(escaped);
+        const buf = try std.fmt.bufPrint(&self.send_buf, "/data/{}/{}/{s}/", .{ self.id, self.sent, escaped });
+        self.send_buf_len = buf.len;
+        const written = try posix.sendto(self.socket, buf, 0, &self.addr.any, @sizeOf(net.Address));
+        if (written != buf.len) {
+            return error.IncompleteSend;
+        }
+        std.debug.print("--> {s}\n", .{buf});
+    }
+    fn should_resend(self: *Self) bool {
+        const now = std.time.timestamp();
+        return now - self.last_data_send_timestamp >= self.retransmission_timeout;
+    }
 };
+
+const Sessions = std.AutoHashMap(u48, Session);
 
 pub fn handle(socket: posix.socket_t) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var sessions = std.StringHashMap(Session).init(allocator);
+    var sessions = Sessions.init(allocator);
     defer sessions.deinit();
 
     var buf: [1000]u8 = undefined;
     while (true) {
         var client_address: net.Address = undefined;
         var client_address_len: posix.socklen_t = @sizeOf(net.Address);
+        const session_key: u48 = (@as(u48, client_address.in.sa.addr) << 16) | @as(u48, client_address.in.sa.port);
         const n = try posix.recvfrom(socket, &buf, 0, &client_address.any, &client_address_len);
-        const message = buf[0..n];
-        const token_list = try tokenize(allocator, message);
-        std.debug.print("TOKENS:\n", .{});
-        for (token_list.tokens) |t| if (t) |token| {
-            std.debug.print("\t{s}\n", .{token.data});
+        var session = blk: {
+            const gop = try sessions.getOrPut(session_key);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = Session.init(allocator, socket, client_address);
+            }
+            break :blk gop.value_ptr;
+        };
+
+        session.handle(buf[0..n]) catch |err| {
+            std.debug.print("session '{}' error: {}\n", .{ session.id, err });
         };
     }
 }
