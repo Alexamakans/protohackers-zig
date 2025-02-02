@@ -50,9 +50,29 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
+    // STUFF FOR ZLS
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // This is where the interesting part begins.
+    // As you can see we are re-defining the same
+    // executable but we're binding it to a
+    // dedicated build step.
+    const exe_check = b.addExecutable(.{
+        .name = "check_compile",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Any other code to define dependencies would
+    // probably be here.
+
+    // These two lines you might want to copy
+    // (make sure to rename 'exe_check')
+    const check = b.step("check", "check_compile");
+    check.dependOn(&exe_check.step);
 }

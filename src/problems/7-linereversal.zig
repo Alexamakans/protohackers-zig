@@ -7,231 +7,210 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const TokenIterator = std.mem.TokenIterator(u8, .scalar);
 
+fn makeSessionKey(addr: net.Address) u48 {
+    return (@as(u48, addr.in.sa.addr) << 16) | @as(u48, addr.in.sa.port);
+}
+const Sessions = std.AutoHashMap(u48, Session);
 const Session = struct {
-    allocator: Allocator,
-    socket: posix.socket_t,
+    // TODO: Queue for sending?
     addr: net.Address,
-    last_data_send_timestamp: i64,
-    last_ack_timestamp: i64,
-    id: u32 = 0,
-    connected: bool = false,
-    send_buf_len: usize = 0,
-    send_buf: [1000]u8 = undefined,
-    retransmission_timeout: i64 = std.time.ns_per_s * 3,
-    session_expiry_timeout: i64 = std.time.ns_per_s * 60,
-    received: u32 = 0,
-    sent_data_len: usize = 0,
-    sent: u32 = 0,
-    awaiting_ack: bool = false,
-
-    buf_start: usize = 0,
-    buf_pos: usize = 0,
-    buf: [16384]u8 = undefined,
-
-    line_send_buf_len: usize = 0,
-    line_send_buf_pos: usize = 0,
-    line_send_buf: [12000]u8 = undefined,
-
+    id: i64 = 0,
+    is_connected: bool = false,
     const Self = @This();
-    fn init(allocator: Allocator, socket: posix.socket_t, addr: net.Address) Self {
-        return Session{
-            .allocator = allocator,
-            .socket = socket,
-            .addr = addr,
-            .last_ack_timestamp = std.time.timestamp(),
-            .last_data_send_timestamp = std.time.timestamp(),
-        };
-    }
-
-    fn get_line(self: *Self) ?[]u8 {
-        if (self.buf_start >= self.buf_pos) {
-            return null;
+    fn process(self: *Self, packet: anytype) !void {
+        std.debug.print("{s}\n", .{@typeName(@TypeOf(packet))});
+        switch (@TypeOf(packet)) {
+            PacketConnect => {
+                self.is_connected = true;
+                std.debug.print("PacketConnect(session_id={})\n", .{packet.data.session_id});
+            },
+            PacketData => {
+                std.debug.print("PacketData(session_id={}, pos={}, data={s})\n", .{ packet.data.session_id, packet.data.pos, packet.data.data });
+            },
+            PacketAck => {
+                std.debug.print("PacketAck(session_id={}, length={})\n", .{ packet.data.session_id, packet.data.length });
+            },
+            PacketClose => {
+                std.debug.print("PacketClose(session_id={})\n", .{packet.data.session_id});
+            },
+            else => return error.UnsupportedPacket,
         }
-        if (std.mem.indexOfScalar(u8, self.buf[self.buf_start..self.buf_pos], '\n')) |i| {
-            const res = self.buf[self.buf_start..i];
-            self.buf_start += i + 1;
-            return res;
-        }
-        return null;
-    }
-    fn deinit(self: *Self) void {
-        _ = self;
-        // no-op
-    }
-    fn handle(self: *Self, data: []const u8) !void {
-        if (self.awaiting_ack) {
-            if (self.should_resend()) {
-                try self.send_data(self.send_buf[0..self.send_buf_len]);
-                return;
-            }
-        }
-
-        if (!self.awaiting_ack) {
-            if (self.line_send_buf_len > 0) {
-                const remaining = try math.sub(usize, self.line_send_buf_len, self.line_send_buf_pos);
-                const len = if (remaining > 800) 800 else remaining;
-                try self.send_data(self.line_send_buf[self.line_send_buf_pos .. self.line_send_buf_pos + len]);
-                self.line_send_buf_pos += len;
-                if (len == remaining) {
-                    self.line_send_buf_len = 0;
-                    self.line_send_buf_pos = 0;
-                }
-            }
-        }
-
-        var token_list = try tokenize(self.allocator, data);
-        defer token_list.deinit();
-
-        const packet_type: []const u8 = token_list.tokens[0].?.data;
-        std.debug.print("<-- {s}\n", .{data});
-        if (std.mem.eql(u8, packet_type, "connect")) {
-            const id_str = token_list.tokens[1].?.data;
-            self.id = try std.fmt.parseInt(@TypeOf(self.id), id_str, 0);
-            try self.send_ack(0);
-            self.connected = true;
-            return;
-        } else if (std.mem.eql(u8, packet_type, "close")) {
-            try self.send_close();
-            return;
-        } else if (std.mem.eql(u8, packet_type, "data")) {
-            if (!self.connected) {
-                try self.send_close();
-                return error.NotConnected;
-            }
-
-            const pos = try std.fmt.parseInt(u32, token_list.tokens[2].?.data, 0);
-            if (self.received < pos) {
-                try self.send_ack(self.received);
-                return;
-            }
-            if (self.received > pos) {
-                return;
-            }
-            const d = try unescape(self.allocator, token_list.tokens[3].?.data);
-            defer self.allocator.free(d);
-            self.received += @intCast(d.len);
-            try self.send_ack(self.received);
-
-            if (self.buf.len - self.buf_pos < 10000) {
-                std.mem.copyForwards(u8, self.buf[0..], self.buf[self.buf_start..self.buf_pos]);
-                self.buf_pos -= self.buf_start;
-                self.buf_start = 0;
-            }
-            @memcpy(self.buf[self.buf_pos .. self.buf_pos + d.len], d);
-        } else if (std.mem.eql(u8, packet_type, "ack")) {
-            if (!self.connected) {
-                try self.send_close();
-                return error.NotConnected;
-            }
-
-            const length = try std.fmt.parseInt(u32, token_list.tokens[2].?.data, 0);
-            if (length <= self.received) {
-                return;
-            }
-            if (length > self.sent) {
-                if (length == self.sent + self.sent_data_len) {
-                    self.sent = length;
-                    self.awaiting_ack = false;
-                } else {
-                    try self.send_close();
-                    return error.BadClient;
-                }
-            }
-            if (length == self.sent) {
-                try self.send_data(self.send_buf[0..self.send_buf_len]);
-            }
-        } else {
-            std.debug.print("'{}' sent unexpected packet type: '{s}'\n", .{ self.id, packet_type });
-        }
-    }
-    fn send_ack(self: *Self, length: u32) !void {
-        const buf = try std.fmt.bufPrint(&self.send_buf, "/ack/{}/{}/", .{ self.id, length });
-        self.send_buf_len = buf.len;
-        const written = try posix.sendto(self.socket, buf, 0, &self.addr.any, @sizeOf(net.Address));
-        if (written != buf.len) {
-            return error.IncompleteSend;
-        }
-        std.debug.print("--> {s}\n", .{buf});
-    }
-    fn send_close(self: *Self) !void {
-        const buf = try std.fmt.bufPrint(&self.send_buf, "/close/{}/", .{self.id});
-        self.send_buf_len = buf.len;
-        const written = try posix.sendto(self.socket, buf, 0, &self.addr.any, @sizeOf(net.Address));
-        if (written != buf.len) {
-            return error.IncompleteSend;
-        }
-        std.debug.print("--> {s}\n", .{buf});
-    }
-    fn send_data(self: *Self, data: []const u8) !void {
-        const now = std.time.timestamp();
-        if (now - self.last_ack_timestamp > self.session_expiry_timeout) {
-            try self.send_close();
-            return error.Timeout;
-        }
-
-        self.last_data_send_timestamp = now;
-        const escaped = try escape(self.allocator, data);
-        defer self.allocator.free(escaped);
-        const buf = try std.fmt.bufPrint(&self.send_buf, "/data/{}/{}/{s}/", .{ self.id, self.sent, escaped });
-        self.send_buf_len = buf.len;
-        const written = try posix.sendto(self.socket, buf, 0, &self.addr.any, @sizeOf(net.Address));
-        if (written != buf.len) {
-            return error.IncompleteSend;
-        }
-        self.awaiting_ack = true;
-        std.debug.print("--> {s}\n", .{buf});
-    }
-    fn should_resend(self: *Self) bool {
-        const now = std.time.timestamp();
-        return now - self.last_data_send_timestamp >= self.retransmission_timeout;
-    }
-    fn send_line(self: *Self, data: []const u8) !void {
-        if (self.line_send_buf_len > 0) {
-            return error.Busy;
-        }
-
-        @memcpy(self.line_send_buf[0..data.len], data);
-        self.line_send_buf[data.len] = '\n';
-        self.line_send_buf_len = data.len + 1;
-        self.line_send_buf_pos = 0;
     }
 };
 
-const Sessions = std.AutoHashMap(u48, Session);
+fn LRCPPacket(comptime packet_id: []const u8, comptime SessionIdType: type, comptime fields: anytype) type {
+    var field_list: []const std.builtin.Type.StructField = &.{
+        .{
+            .name = "allocator",
+            .type = Allocator,
+            .default_value = null,
+            .is_comptime = false,
+            .alignment = @alignOf(Allocator),
+        },
+        .{
+            .name = "session_id",
+            .type = SessionIdType,
+            .default_value = null,
+            .is_comptime = false,
+            .alignment = @alignOf(SessionIdType),
+        },
+    };
+
+    comptime {
+        for (fields) |field| {
+            field_list = field_list ++ .{
+                .{
+                    .name = field.name,
+                    .type = field.type,
+                    .default_value = null,
+                    .is_comptime = false,
+                    .alignment = @alignOf(field.type),
+                },
+            };
+        }
+    }
+
+    const Packet = @Type(std.builtin.Type{
+        .Struct = .{
+            .layout = .auto,
+            .fields = field_list,
+            .decls = &.{},
+            .is_tuple = false,
+        },
+    });
+
+    return struct {
+        data: Packet,
+        pub fn isInitableFrom(token_list: TokenList) bool {
+            if (token_list.tokens.len == 0) {
+                return false;
+            }
+            return std.mem.eql(u8, token_list.tokens[0].?.data, packet_id);
+        }
+        pub fn init(allocator: Allocator, token_list: TokenList) !@This() {
+            var result: @This() = undefined;
+            result.data.allocator = allocator;
+            const dataTypeInfo = @typeInfo(@TypeOf(result.data));
+            switch (dataTypeInfo) {
+                .Struct => |info| {
+                    if (token_list.tokens.len != info.fields.len) {
+                        return error.InvalidPacket;
+                    }
+                    inline for (info.fields[1..], 0..) |field, field_index| {
+                        const token = token_list.tokens[1 + field_index].?.data;
+                        std.debug.print("token: {s}\n", .{token});
+                        switch (@typeInfo(field.type)) {
+                            .Int => {
+                                @field(result.data, field.name) = try std.fmt.parseInt(field.type, token, 0);
+                            },
+                            .Pointer => {
+                                const s = try allocator.alloc(u8, token.len);
+                                @memcpy(s, token);
+                                @field(result.data, field.name) = s;
+                            },
+                            else => return error.UnsupportedType,
+                        }
+                    }
+                    return result;
+                },
+                else => unreachable,
+            }
+        }
+        pub fn deinit(self: *@This()) void {
+            const dataTypeInfo = @typeInfo(@TypeOf(self.data));
+            switch (dataTypeInfo) {
+                .Struct => |info| {
+                    inline for (info.fields) |field| {
+                        switch (@typeInfo(field.type)) {
+                            .Pointer => self.data.allocator.free(@field(self.data, field.name)),
+                            else => {},
+                        }
+                    }
+                },
+                else => unreachable,
+            }
+        }
+    };
+}
+
+const PacketConnect = LRCPPacket("connect", i32, .{});
+const PacketData = LRCPPacket("data", i32, .{ .{ .name = "pos", .type = i32 }, .{ .name = "data", .type = []const u8 } });
+const PacketAck = LRCPPacket("ack", i32, .{.{ .name = "length", .type = i32 }});
+const PacketClose = LRCPPacket("close", i32, .{});
+const PacketTypes = [4]type{ PacketConnect, PacketData, PacketAck, PacketClose };
+
+test "using LRCPPacket" {
+    var token_list = try tokenize(testing.allocator, "/data/0/hello PacketData/");
+    defer token_list.deinit();
+
+    if (PacketData.isInitableFrom(token_list)) {
+        var packet = try PacketData.init(testing.allocator, token_list);
+        defer packet.deinit();
+
+        std.debug.print("PacketData(pos={}, data='{s}')\n", .{ packet.data.pos, packet.data.data });
+    }
+}
+
+const Client = struct {
+    allocator: Allocator,
+    socket: posix.socket_t,
+    sessions: Sessions,
+    const Self = @This();
+    fn init(self: *Self, allocator: Allocator, socket: posix.socket_t) !void {
+        self.allocator = allocator;
+        self.socket = socket;
+        self.sessions = Sessions.init(self.allocator);
+    }
+    fn deinit(self: *Self) void {
+        self.sessions.deinit();
+    }
+    fn listen(self: *Self) !void {
+        var buf: [1000]u8 = undefined;
+        while (true) {
+            var client_address: net.Address = undefined;
+            var client_address_len: posix.socklen_t = @sizeOf(net.Address);
+            const n = try posix.recvfrom(self.socket, &buf, 0, &client_address.any, &client_address_len);
+            var session = try self.getSession(client_address);
+            const data = buf[0..n];
+            std.debug.print("<-- {s}\n", .{data});
+            var token_list = try tokenize(self.allocator, data);
+            defer token_list.deinit();
+            if (PacketConnect.isInitableFrom(token_list)) {
+                var packet = try PacketConnect.init(self.allocator, token_list);
+                defer packet.deinit();
+                try session.process(packet);
+            }
+            //blk: {
+            //    inline for (PacketTypes) |PacketType| {
+            //        if (PacketType.isInitableFrom(token_list)) {
+            //            var packet = try PacketType.init(self.allocator, token_list);
+            //            defer packet.deinit();
+            //            try session.process(packet);
+            //            break :blk;
+            //        }
+            //    }
+            //    std.debug.print("invalid packet: {s}\n", .{data});
+            //}
+        }
+    }
+    fn getSession(self: *Self, addr: net.Address) !*Session {
+        const gop = try self.sessions.getOrPut(makeSessionKey(addr));
+        if (!gop.found_existing) {
+            gop.value_ptr.* = Session{ .addr = addr };
+        }
+        return gop.value_ptr;
+    }
+};
+var client: Client = undefined;
 
 pub fn handle(socket: posix.socket_t) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var sessions = Sessions.init(allocator);
-    defer sessions.deinit();
-
-    var buf: [1000]u8 = undefined;
-    while (true) {
-        var client_address: net.Address = undefined;
-        var client_address_len: posix.socklen_t = @sizeOf(net.Address);
-        const session_key: u48 = (@as(u48, client_address.in.sa.addr) << 16) | @as(u48, client_address.in.sa.port);
-        const n = try posix.recvfrom(socket, &buf, 0, &client_address.any, &client_address_len);
-        var session = blk: {
-            const gop = try sessions.getOrPut(session_key);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = Session.init(allocator, socket, client_address);
-            }
-            break :blk gop.value_ptr;
-        };
-
-        session.handle(buf[0..n]) catch |err| {
-            std.debug.print("session '{}' error: {}\n", .{ session.id, err });
-        };
-
-        if (session.get_line()) |line| {
-            std.mem.reverse(u8, line);
-            session.send_line(line) catch |err| if (err != error.Busy) {
-                std.debug.print("error sending line: {}\n", .{err});
-            };
-        }
-    }
+    try client.init(allocator, socket);
+    defer client.deinit();
+    try client.listen();
 }
 
 const Token = struct {
@@ -297,16 +276,12 @@ const TokenList = struct {
 };
 
 test "joining" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
     const data = "/connect/1234/\\/too\\\\coolfor/school/";
-    var token_list = try tokenize(allocator, data);
+    var token_list = try tokenize(testing.allocator, data);
     defer token_list.deinit();
 
-    const actual = try token_list.join(allocator);
-    defer allocator.free(actual);
+    const actual = try token_list.join(testing.allocator);
+    defer testing.allocator.free(actual);
     try testing.expectEqualSlices(u8, data, actual);
 }
 
@@ -344,12 +319,8 @@ fn tokenize(allocator: Allocator, data: []const u8) !TokenList {
 }
 
 test "tokenizing" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
     const data = "/connect/1234/\\/too\\\\coolfor/school/";
-    var token_list = try tokenize(allocator, data);
+    var token_list = try tokenize(testing.allocator, data);
     defer token_list.deinit();
     try testing.expectEqualSlices(u8, "connect", token_list.tokens[0].?.data);
     try testing.expectEqualSlices(u8, "1234", token_list.tokens[1].?.data);
@@ -374,11 +345,8 @@ fn escape(allocator: Allocator, data: []const u8) ![]u8 {
 }
 
 test "escaping" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    const actual = try escape(allocator, "/foo/bar\\baz");
-    defer allocator.free(actual);
+    const actual = try escape(testing.allocator, "/foo/bar\\baz");
+    defer testing.allocator.free(actual);
     try testing.expectEqualSlices(u8, "\\/foo\\/bar\\\\baz", actual);
 }
 
@@ -398,10 +366,7 @@ fn unescape(allocator: Allocator, data: []const u8) ![]u8 {
 }
 
 test "unescaping" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    const actual = try unescape(allocator, "\\/foo\\/bar\\\\baz");
-    defer allocator.free(actual);
+    const actual = try unescape(testing.allocator, "\\/foo\\/bar\\\\baz");
+    defer testing.allocator.free(actual);
     try testing.expectEqualSlices(u8, "/foo/bar\\baz", actual);
 }
